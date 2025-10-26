@@ -133,8 +133,11 @@ class BlindAssistant {
     final now = DateTime.now();
     final criticalObjects = objects.where((obj) => obj.priority == Priority.critical).toList();
     final highPriorityObjects = objects.where((obj) => obj.priority == Priority.high).toList();
+    final indoorObjects = objects.where((obj) => 
+      ['person', 'bottle', 'cup', 'chair', 'dining table', 'laptop', 'tv', 'book', 'cell phone', 'keyboard', 'mouse', 'couch', 'bed', 'potted plant', 'clock', 'vase'].contains(obj.label)
+    ).toList();
     
-    String guidance = "Path appears clear. Continue forward.";
+    String guidance = "Point your camera at objects around you...";
     bool isSafeToMove = true;
     String warning = "";
 
@@ -147,12 +150,31 @@ class BlindAssistant {
       final person = highPriorityObjects.firstWhere((obj) => obj.type == ObjectType.person, orElse: () => highPriorityObjects.first);
       guidance = "${person.label} detected ${_getDirectionText(person.direction)}. Proceed with caution.";
       warning = "Person nearby - slow down";
-    } else {
-      final obstacles = objects.where((obj) => obj.type == ObjectType.furniture || obj.type == ObjectType.other).toList();
-      if (obstacles.isNotEmpty) {
-        final obstacle = obstacles.first;
-        guidance = "${obstacle.label} ${_getDirectionText(obstacle.direction)}. Adjust your path.";
+    } else if (indoorObjects.isNotEmpty) {
+      // Indoor-specific guidance
+      final objectsByType = <String, List<DetectedObject>>{};
+      for (final obj in indoorObjects) {
+        objectsByType.putIfAbsent(obj.label, () => []).add(obj);
       }
+      
+      final sortedObjects = objectsByType.entries.toList()
+        ..sort((a, b) => b.value.length.compareTo(a.value.length));
+      
+      if (sortedObjects.isNotEmpty) {
+        final mainObject = sortedObjects.first.value.first;
+        final count = sortedObjects.first.value.length;
+        final countText = count > 1 ? " ($count detected)" : "";
+        
+        guidance = "${mainObject.label}$countText ${_getDirectionText(mainObject.direction)}. ";
+        
+        // Add additional objects if detected
+        if (sortedObjects.length > 1) {
+          final additionalObjects = sortedObjects.skip(1).take(2).map((e) => e.key).join(', ');
+          guidance += "Also detected: $additionalObjects.";
+        }
+      }
+    } else {
+      guidance = "No objects detected. Try pointing at furniture, bottles, or other indoor items.";
     }
 
     return NavigationContext(
@@ -406,12 +428,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             // Convert simple string list to DetectedObject list for blind assistance
             _currentObjects = message.map((label) {
               final now = DateTime.now();
+              // For indoor testing, prioritize common indoor objects
+              final isIndoorObject = ['person', 'bottle', 'cup', 'chair', 'dining table', 'laptop', 'tv', 'book', 'cell phone', 'keyboard', 'mouse', 'couch', 'bed', 'potted plant', 'clock', 'vase'].contains(label);
+              
               return DetectedObject(
                 label: label,
-                confidence: 0.8, // Default confidence
+                confidence: isIndoorObject ? 0.9 : 0.7, // Higher confidence for indoor objects
                 type: BlindAssistant.getObjectType(label),
                 priority: BlindAssistant.getPriority(label),
-                direction: Direction.center, // Default direction
+                direction: Direction.center, // Default direction - will be improved with bounding boxes
                 distance: 0.5, // Default distance
                 timestamp: now,
                 boundingBox: const Rect.fromLTWH(0, 0, 100, 100), // Default bounding box
@@ -460,22 +485,52 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _speak("Testing voice output. Can you hear me?");
   }
 
-  void _testNavigation() {
-    debugPrint("[Main] Testing navigation guidance");
+  void _testIndoorDetection() {
+    debugPrint("[Main] Testing indoor object detection");
     final testObjects = [
       DetectedObject(
-        label: "car",
+        label: "bottle",
         confidence: 0.9,
-        type: ObjectType.vehicle,
-        priority: Priority.critical,
-        direction: Direction.center,
+        type: ObjectType.food,
+        priority: Priority.low,
+        direction: Direction.right,
         distance: 0.3,
+        timestamp: DateTime.now(),
+        boundingBox: const Rect.fromLTWH(0, 0, 100, 100),
+      ),
+      DetectedObject(
+        label: "chair",
+        confidence: 0.85,
+        type: ObjectType.furniture,
+        priority: Priority.medium,
+        direction: Direction.left,
+        distance: 0.4,
+        timestamp: DateTime.now(),
+        boundingBox: const Rect.fromLTWH(0, 0, 100, 100),
+      ),
+      DetectedObject(
+        label: "person",
+        confidence: 0.95,
+        type: ObjectType.person,
+        priority: Priority.high,
+        direction: Direction.center,
+        distance: 0.2,
         timestamp: DateTime.now(),
         boundingBox: const Rect.fromLTWH(0, 0, 100, 100),
       ),
     ];
     final context = BlindAssistant.analyzeScene(testObjects);
     _speakGuidance(context);
+    
+    // Update UI to show test results
+    setState(() {
+      _currentObjects = testObjects;
+      _narrationText = context.guidance;
+      _currentGuidance = context.guidance;
+      _isSafeToMove = context.isSafeToMove;
+      _currentWarning = context.warning;
+      _debugInfo = "TEST MODE: Objects: ${testObjects.length} | Safe: ${_isSafeToMove ? 'Yes' : 'No'} | ${context.warning.isNotEmpty ? 'WARNING: ' + context.warning : 'Clear'}";
+    });
   }
 
   @override
@@ -491,9 +546,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             tooltip: 'Test Voice',
           ),
           IconButton(
-            icon: const Icon(Icons.navigation),
-            onPressed: _testNavigation,
-            tooltip: 'Test Navigation',
+            icon: const Icon(Icons.home),
+            onPressed: _testIndoorDetection,
+            tooltip: 'Test Indoor Detection',
           ),
         ],
       ),
@@ -659,18 +714,16 @@ void _inferenceIsolate(IsolateInitData initData) async {
          continue;
        }
        try {
-          // Create input tensor with proper uint8 format
-          final reshapedInput = List.generate(1, (_) => 
-            List.generate(300, (y) => 
-              List.generate(300, (x) {
-                final index = (y * 300 + x) * 3;
-                return [
-                  input[index].clamp(0, 255).toInt(),
-                  input[index + 1].clamp(0, 255).toInt(),
-                  input[index + 2].clamp(0, 255).toInt(),
-                ];
-              })
-            )
+          // Create input tensor with proper uint8 format - try different approach
+          final reshapedInput = List.generate(300, (y) => 
+            List.generate(300, (x) {
+              final index = (y * 300 + x) * 3;
+              return [
+                input[index].round().clamp(0, 255).toInt(),
+                input[index + 1].round().clamp(0, 255).toInt(),
+                input[index + 2].round().clamp(0, 255).toInt(),
+              ];
+            })
           );
 
          final output = {
