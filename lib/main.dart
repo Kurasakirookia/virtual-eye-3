@@ -18,7 +18,6 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
     cameras = await availableCameras();
-    debugPrint('Found ${cameras.length} cameras');
   } on CameraException catch (e) {
     debugPrint('Error finding cameras: ${e.code}\nError Message: ${e.description}');
   }
@@ -62,6 +61,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   final FlutterTts _flutterTts = FlutterTts();
   Set<String> _lastSpokenObjects = {};
 
+  bool _isIsolateReady = false;
+
   @override
   void initState() {
     super.initState();
@@ -71,26 +72,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   Future<void> _initTts() async {
-    try {
-      await _flutterTts.setSharedInstance(true);
-      await _flutterTts.setLanguage("en-US");
-      await _flutterTts.setSpeechRate(0.5);
-      await _flutterTts.setVolume(1.0);
-      await _flutterTts.setPitch(1.0);
-      debugPrint('TTS initialized successfully');
-    } catch (e) {
-      debugPrint('Error initializing TTS: $e');
-    }
+    await _flutterTts.setSharedInstance(true);
+    await _flutterTts.setLanguage("en-US");
+    await _flutterTts.setSpeechRate(0.5);
+    await _flutterTts.setVolume(1.0);
+    await _flutterTts.setPitch(1.0);
   }
 
   void _speak(String text) async {
-    try {
-      await _flutterTts.stop();
-      await _flutterTts.speak(text);
-      debugPrint('Speaking: $text');
-    } catch (e) {
-      debugPrint('Error speaking: $e');
-    }
+    await _flutterTts.stop();
+    await _flutterTts.speak(text);
   }
 
   @override
@@ -99,7 +90,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _cameraController?.dispose();
     _isolate?.kill(priority: Isolate.immediate);
     _receivePort.close();
-    _flutterTts.stop();
     super.dispose();
   }
 
@@ -115,25 +105,26 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   Future<void> _requestPermissionAndInit() async {
-    debugPrint('Requesting camera permission...');
+    debugPrint("[Main] Requesting camera permission...");
     if (await Permission.camera.request().isGranted) {
-      debugPrint('Camera permission granted');
+      debugPrint("[Main] Camera permission granted.");
+
+      _startInference();
+
       if (cameras.isNotEmpty) {
         await _initializeCamera(cameras.first);
-        await _startInference();
       } else {
+        debugPrint("[Main] No cameras available.");
         if (mounted) setState(() => _narrationText = "No cameras available.");
-        _speak("No cameras available");
       }
     } else {
-      debugPrint('Camera permission denied');
+      debugPrint("[Main] Camera permission denied.");
       if (mounted) setState(() => _narrationText = "Camera permission denied.");
-      _speak("Camera permission denied");
     }
   }
 
   Future<void> _initializeCamera(CameraDescription cameraDescription) async {
-    debugPrint('Initializing camera...');
+    debugPrint("[Main] Initializing camera...");
     _cameraController = CameraController(
       cameraDescription,
       ResolutionPreset.medium,
@@ -142,39 +133,42 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     );
     try {
       await _cameraController!.initialize();
+      debugPrint("[Main] Camera initialized successfully.");
       if (!mounted) return;
       setState(() {
         _isCameraInitialized = true;
         _narrationText = "Point at your surroundings...";
       });
-      debugPrint('Camera initialized successfully');
-      
-      _cameraController!.startImageStream((image) {
-        if (!_isProcessing && _sendPort != null) {
-          _isProcessing = true;
-          _sendPort!.send(image);
-        }
-      });
-      debugPrint('Image stream started');
-    } on CameraException catch (e) {
-      debugPrint('Error initializing camera: $e');
-      if (mounted) {
-        setState(() => _narrationText = "Failed to initialize camera.");
-        _speak("Failed to initialize camera");
+      if (_isIsolateReady) {
+         _startStreaming();
       }
+    } on CameraException catch (e) {
+      debugPrint('[Main] Error initializing camera: $e');
+      if (mounted) setState(() => _narrationText = "Failed to initialize camera.");
     }
   }
 
-  Future<void> _startInference() async {
-    debugPrint('Starting inference isolate...');
+  void _startStreaming() {
+     debugPrint("[Main] Starting camera stream...");
+     _cameraController!.startImageStream((image) {
+       if (!_isProcessing && _sendPort != null) {
+         _isProcessing = true;
+         final input = _prepareInput(image);
+         if (input != null) {
+           _sendPort!.send(input);
+         } else {
+           _isProcessing = false;
+         }
+       }
+     });
+  }
+
+  void _startInference() async {
+    debugPrint("[Main] Starting inference isolate setup...");
     try {
       final modelBytes = await rootBundle.load('assets/ssd_mobilenet.tflite');
-      debugPrint('Model loaded: ${modelBytes.lengthInBytes} bytes');
-      
       final labelsData = await rootBundle.loadString('assets/labels.txt');
-      final labelsList = labelsData.split('\n').where((l) => l.trim().isNotEmpty).toList();
-      debugPrint('Labels loaded: ${labelsList.length} labels');
-      debugPrint('First 5 labels: ${labelsList.take(5).join(", ")}');
+      debugPrint("[Main] Model and labels loaded from assets.");
 
       final initData = IsolateInitData(
         modelBytes.buffer.asUint8List(),
@@ -183,16 +177,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
 
       _isolate = await Isolate.spawn(_inferenceIsolate, initData);
-      debugPrint('Isolate spawned successfully');
-      
+      debugPrint("[Main] Inference isolate spawned.");
+
       _receivePort.listen((message) {
         if (message is SendPort) {
           _sendPort = message;
-          debugPrint('SendPort received from isolate');
-        } else if (message is String && message.startsWith('DEBUG:')) {
-          debugPrint('Isolate: $message');
+          _isIsolateReady = true;
+          debugPrint("[Main] Received SendPort from isolate. Isolate is ready.");
+          if (_isCameraInitialized) {
+             _startStreaming();
+          }
         } else if (message is List<String>) {
-          debugPrint('Received detections: $message');
           if (mounted) {
             final currentObjects = message.toSet();
             String narration;
@@ -201,8 +196,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             } else {
               narration = "I see: ${currentObjects.join(', ')}";
             }
-            setState(() => _narrationText = narration);
-            
+            if (narration != _narrationText) {
+                setState(() => _narrationText = narration);
+            }
             if (!const SetEquality().equals(currentObjects, _lastSpokenObjects)) {
               _lastSpokenObjects = currentObjects;
               if (currentObjects.isNotEmpty) {
@@ -210,47 +206,22 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
               }
             }
           }
+        } else if (message is String && message.startsWith("ERROR:")) {
+            debugPrint("[Main] Received error from isolate: $message");
+            if(mounted) setState(() => _narrationText = message);
         }
         _isProcessing = false;
       });
     } catch (e) {
-      debugPrint('Error starting inference: $e');
-      if (mounted) {
-        setState(() => _narrationText = "Failed to load model: $e");
-        _speak("Failed to load model");
-      }
+      debugPrint('[Main] Error starting inference: $e');
+      if (mounted) setState(() => _narrationText = "Failed to load model.");
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Virtual Eye'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.info_outline),
-            onPressed: () {
-              showDialog(
-                context: context,
-                builder: (context) => AlertDialog(
-                  title: const Text('Debug Info'),
-                  content: Text('Camera: $_isCameraInitialized\n'
-                      'Processing: $_isProcessing\n'
-                      'SendPort: ${_sendPort != null}\n'
-                      'Last spoken: ${_lastSpokenObjects.join(", ")}'),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(context),
-                      child: const Text('OK'),
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Virtual Eye')),
       body: Column(
         children: [
           Expanded(
@@ -258,19 +229,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             child: Container(
               color: Colors.black,
               child: Center(
-                child: _isCameraInitialized && 
-                       _cameraController != null && 
-                       _cameraController!.value.isInitialized
+                child: _isCameraInitialized && _cameraController != null && _cameraController!.value.isInitialized
                     ? CameraPreview(_cameraController!)
-                    : const Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          CircularProgressIndicator(),
-                          SizedBox(height: 16),
-                          Text('Initializing camera...', 
-                              style: TextStyle(color: Colors.white)),
-                        ],
-                      ),
+                    : const CircularProgressIndicator(),
               ),
             ),
           ),
@@ -284,11 +245,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                   padding: const EdgeInsets.all(16.0),
                   child: Text(
                     _narrationText,
-                    style: const TextStyle(
-                      color: Colors.white, 
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: const TextStyle(color: Colors.white, fontSize: 18),
                     textAlign: TextAlign.center,
                   ),
                 ),
@@ -301,7 +258,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 }
 
-// Data structure to pass initial data to the isolate
 class IsolateInitData {
   final Uint8List modelBytes;
   final String labelsData;
@@ -315,155 +271,130 @@ class Detection {
   Detection(this.label, this.score);
 }
 
-// Isolate for running inference
 void _inferenceIsolate(IsolateInitData initData) async {
   final port = ReceivePort();
   initData.sendPort.send(port.sendPort);
-  
-  initData.sendPort.send('DEBUG: Isolate started');
+
+  Interpreter? interpreter;
+  List<String> labels = [];
 
   try {
+    debugPrint("[Isolate] Initializing...");
     final interpreterOptions = InterpreterOptions();
     if (Platform.isAndroid) {
       interpreterOptions.addDelegate(XNNPackDelegate());
-      initData.sendPort.send('DEBUG: Using XNNPack delegate');
     }
 
-    final interpreter = Interpreter.fromBuffer(
-      initData.modelBytes, 
-      options: interpreterOptions
-    );
+    interpreter = Interpreter.fromBuffer(initData.modelBytes, options: interpreterOptions);
+    labels = initData.labelsData.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    debugPrint("[Isolate] Interpreter and labels loaded.");
     
-    initData.sendPort.send('DEBUG: Interpreter created');
-    initData.sendPort.send('DEBUG: Input shape: ${interpreter.getInputTensor(0).shape}');
-    initData.sendPort.send('DEBUG: Output tensors: ${interpreter.getOutputTensors().length}');
-    
-    final labels = initData.labelsData
-        .split('\n')
-        .where((l) => l.trim().isNotEmpty)
-        .toList();
-    
-    initData.sendPort.send('DEBUG: ${labels.length} labels loaded');
-    
-    const priority = {
-      'person': 10, 
-      'car': 5, 
-      'bus': 5, 
-      'truck': 5,
-      'bicycle': 4, 
-      'motorcycle': 4,
-      'dog': 3, 
-      'cat': 3,
-      'chair': 2,
-      'bottle': 2,
-    };
-    const topK = 5;
-    const confidenceThreshold = 0.3; // Lowered threshold
+    const priority = {'person': 10, 'car': 5, 'bus': 5, 'bicycle': 4, 'dog': 3, 'cat': 3};
+    const topK = 3;
 
-    int frameCount = 0;
-    await for (final CameraImage image in port) {
-      frameCount++;
-      try {
-        final input = _prepareInput(image);
-        if (input == null) {
-          initData.sendPort.send('DEBUG: Failed to prepare input');
-          continue;
-        }
+    await for (final dynamic message in port) {
+       if (message is! Uint8List) {
+         continue;
+       }
+       final Uint8List input = message;
+       if (interpreter == null) {
+         debugPrint("[Isolate] Interpreter not ready, skipping frame.");
+         continue;
+       }
+       try {
+         final reshapedInput = [
+           List.generate(300, (y) => List.generate(300, (x) {
+             final index = (y * 300 + x) * 3;
+             return [
+               (input[index] - 127.5) / 127.5,
+               (input[index + 1] - 127.5) / 127.5,
+               (input[index + 2] - 127.5) / 127.5,
+             ];
+           }))
+         ];
+
+         final output = {
+           0: [List.generate(25, (_) => List.filled(4, 0.0))],
+           1: [List.filled(25, 0.0)],
+           2: [List.filled(25, 0.0)],
+           3: [0.0],
+         };
+
+         interpreter.runForMultipleInputs([reshapedInput], output);
+         debugPrint("[Isolate] Inference complete.");
         
-        // Reshape input to [1, 300, 300, 3] with normalization
-        final reshapedInput = [
-          List.generate(300, (y) => List.generate(300, (x) {
-            final index = (y * 300 + x) * 3;
-            return [
-              (input[index] - 127.5) / 127.5,
-              (input[index + 1] - 127.5) / 127.5,
-              (input[index + 2] - 127.5) / 127.5,
-            ];
-          }))
-        ];
-
-        // Prepare output buffers
-        final output = {
-          0: [List.generate(10, (_) => List.filled(4, 0.0))], // Bounding boxes
-          1: [List.filled(10, 0.0)],                           // Classes
-          2: [List.filled(10, 0.0)],                           // Scores
-          3: [0.0],                                            // Number of detections
-        };
-
-        interpreter.runForMultipleInputs([reshapedInput], output);
+         final scores = (output[2]![0] as List<dynamic>).cast<double>();
+         final classes = (output[1]![0] as List<dynamic>).cast<double>();
         
-        final numDetections = (output[3]![0] as double).toInt();
-        final scores = (output[2]![0] as List<dynamic>).cast<double>();
-        final classes = (output[1]![0] as List<dynamic>).cast<double>();
-        
-        // Log every 30th frame
-        if (frameCount % 30 == 0) {
-          initData.sendPort.send('DEBUG: Frame $frameCount - Detections: $numDetections');
-          var topScores = <String>[];
-          for (int i = 0; i < scores.length.clamp(0, 5); i++) {
-            if (classes[i].toInt() < labels.length) {
-              topScores.add('${labels[classes[i].toInt()]}: ${scores[i].toStringAsFixed(2)}');
-            }
-          }
-          initData.sendPort.send('DEBUG: Top scores: ${topScores.join(", ")}');
-        }
+         var topDetectionsDebug = <Detection>[];
+         for (int i = 0; i < scores.length; i++) {
+           final classIdx = classes[i].toInt();
+           final labelIndex = classIdx - 1;
+           if (labelIndex >= 0 && labelIndex < labels.length) {
+             topDetectionsDebug.add(Detection(labels[labelIndex], scores[i]));
+           }
+         }
+         topDetectionsDebug.sort((a, b) => b.score.compareTo(a.score));
+         debugPrint("[Isolate] Top Scores: ${topDetectionsDebug.take(3).map((d) => '${d.label}: ${d.score.toStringAsFixed(2)}').join(', ')}");
 
-        List<Detection> detections = [];
-        for (int i = 0; i < scores.length; i++) {
-          if (scores[i] > confidenceThreshold) {
-            final classIndex = classes[i].toInt();
-            if (classIndex < labels.length && classIndex >= 0) {
-              final label = labels[classIndex].trim();
-              if (label.isNotEmpty) {
-                detections.add(Detection(label, scores[i]));
-              }
-            }
-          }
-        }
+         List<Detection> detections = [];
+         for (int i = 0; i < scores.length; i++) {
+           if (scores[i] > 0.5) { 
+             final classIdx = classes[i].toInt();
+             final labelIndex = classIdx - 1;
+             if (labelIndex >= 0 && labelIndex < labels.length) {
+               detections.add(Detection(labels[labelIndex], scores[i]));
+             }
+           }
+         }
 
-        detections.sort((a, b) {
-          final priorityA = priority[a.label] ?? 0;
-          final priorityB = priority[b.label] ?? 0;
-          if (priorityA != priorityB) {
-            return priorityB.compareTo(priorityA);
-          }
-          return b.score.compareTo(a.score);
-        });
+         detections.sort((a, b) {
+           final priorityA = priority[a.label] ?? 0;
+           final priorityB = priority[b.label] ?? 0;
+           return priorityB.compareTo(priorityA);
+         });
 
-        final topDetections = detections
-            .map((d) => d.label)
-            .toSet()
-            .take(topK)
-            .toList();
-            
-        initData.sendPort.send(topDetections);
+         final topDetections = detections.map((d) => d.label).toSet().take(topK).toList();
+         initData.sendPort.send(topDetections);
 
-      } catch (e) {
-        initData.sendPort.send('DEBUG: Inference error: $e');
-        initData.sendPort.send([]);
-      }
+       } catch (e) {
+         debugPrint("[Isolate] Inference Loop ERROR: $e");
+         initData.sendPort.send(<String>[]);
+       }
     }
   } catch (e) {
-    initData.sendPort.send('DEBUG: Isolate initialization error: $e');
+    debugPrint("[Isolate] Initialization ERROR: $e");
+     initData.sendPort.send("ERROR: Isolate failed to initialize.");
+  } finally {
+     interpreter?.close();
   }
 }
 
-// Prepare input image
+// FIXED: Updated to work with newer image package API
 Uint8List? _prepareInput(CameraImage image) {
   const modelInputSize = 300;
   img.Image? convertedImage = _convertYUV420ToImage(image);
   if (convertedImage == null) return null;
 
-  final resizedImage = img.copyResize(
-    convertedImage, 
-    width: modelInputSize, 
-    height: modelInputSize,
-    interpolation: img.Interpolation.linear,
-  );
-  return resizedImage.toUint8List();
+  final resizedImage = img.copyResize(convertedImage, width: modelInputSize, height: modelInputSize);
+
+  final int w = resizedImage.width;
+  final int h = resizedImage.height;
+  final out = Uint8List(w * h * 3);
+  int idx = 0;
+  
+  // FIXED: Use getPixelSafe or iterate through pixels properly
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      final pixel = resizedImage.getPixel(x, y);
+      out[idx++] = pixel.r.toInt();
+      out[idx++] = pixel.g.toInt();
+      out[idx++] = pixel.b.toInt();
+    }
+  }
+  return out;
 }
 
-// Convert YUV420 to RGB
 img.Image? _convertYUV420ToImage(CameraImage image) {
   try {
     final int width = image.width;
@@ -471,7 +402,10 @@ img.Image? _convertYUV420ToImage(CameraImage image) {
     final int uvRowStride = image.planes[1].bytesPerRow;
     final int? uvPixelStride = image.planes[1].bytesPerPixel;
 
-    if (uvPixelStride == null) return null;
+    if (uvPixelStride == null) {
+       debugPrint("[Convert] uvPixelStride is null");
+       return null;
+    }
 
     final imageBytes = img.Image(width: width, height: height);
 
@@ -479,6 +413,10 @@ img.Image? _convertYUV420ToImage(CameraImage image) {
       for (int x = 0; x < width; x++) {
         final int uvIndex = uvPixelStride * (x >> 1) + uvRowStride * (y >> 1);
         final int index = y * width + x;
+
+        if (index >= image.planes[0].bytes.length || uvIndex >= image.planes[1].bytes.length || uvIndex >= image.planes[2].bytes.length) {
+          continue;
+        }
 
         final yp = image.planes[0].bytes[index];
         final up = image.planes[1].bytes[uvIndex];
@@ -488,12 +426,12 @@ img.Image? _convertYUV420ToImage(CameraImage image) {
         int g = (yp - 0.39465 * (up - 128) - 0.58060 * (vp - 128)).toInt().clamp(0, 255);
         int b = (yp + 2.03211 * (up - 128)).toInt().clamp(0, 255);
         
-        imageBytes.setPixelRgba(x, y, r, g, b, 255);
+        imageBytes.setPixelRgb(x, y, r, g, b);
       }
     }
-    return imageBytes;
+     return imageBytes;
   } catch (e) {
-    debugPrint("Error converting YUV image: $e");
+    debugPrint("[Convert] Error: $e");
     return null;
   }
 }
