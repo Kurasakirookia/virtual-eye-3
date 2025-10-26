@@ -78,3 +78,8 @@ scissors
 teddy bear
 hair drier
 toothbrush
+laptop
+phone
+tv
+table
+book
