@@ -20,6 +20,19 @@ dependencies:
   # ADDED: For comparing lists of objects
   collection: ^1.18.0
 
+
+  geolocator: ^11.0.0
+
+  
+  # Voice
+  speech_to_text: ^7.0.0
+  # Note: For the prototype, we will use a BUTTON for activation first. 
+  # Adding 'porcupine_flutter' requires complex native setup per-platform. 
+  # Let's get the connection working first!
+
+  # Networking
+  http: ^1.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
